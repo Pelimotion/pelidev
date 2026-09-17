@@ -249,13 +249,38 @@ fun CameraControlScreen(
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onDoubleTap = { isBlackScreenMode = false },
-                        onLongPress = { isBlackScreenMode = false },
-                        onTap = {
-                            Toast.makeText(context, "Dê um toque duplo para sair da Tela Preta", Toast.LENGTH_SHORT).show()
-                        }
+                        onLongPress = { isBlackScreenMode = false }
+                    )
+                },
+            contentAlignment = Alignment.BottomCenter
+        ) {
+            // Botão discreto para voltar a exibir o HUD e os controles
+            Button(
+                onClick = { isBlackScreenMode = false },
+                modifier = Modifier
+                    .padding(bottom = 42.dp)
+                    .height(44.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF1E1E26).copy(alpha = 0.65f)
+                ),
+                shape = RoundedCornerShape(22.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.18f))
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text("👁️", fontSize = 14.sp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        "Restaurar Controles",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFE5E7EB)
                     )
                 }
-        )
+            }
+        }
         return
     }
 
@@ -566,6 +591,17 @@ fun QrScannerView(
     val scanner = remember { BarcodeScanning.getClient() }
     var isProcessed by remember { mutableStateOf(false) }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                ProcessCameraProvider.getInstance(context).get().unbindAll()
+                cameraExecutor.shutdown()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { ctx ->
@@ -684,10 +720,13 @@ fun WebRtcPreview(cameraService: CameraService) {
                 init(cameraService.getEglBaseContext(), null)
                 setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                 setEnableHardwareScaler(true)
+                setZOrderMediaOverlay(true)
                 cameraService.attachSurfaceView(this)
             }
         },
-        update = { },
+        update = { view ->
+            cameraService.attachSurfaceView(view)
+        },
         onRelease = { view ->
             cameraService.detachSurfaceView(view)
             view.release()

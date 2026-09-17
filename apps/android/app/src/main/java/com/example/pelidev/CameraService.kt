@@ -38,6 +38,7 @@ class CameraService : Service() {
     private var localVideoTrack: VideoTrack? = null
     private var isStreamingStarted = false
 
+    private val attachedSinks = Collections.synchronizedList(mutableListOf<VideoSink>())
     private val eglBase = EglBase.create()
     private var batchedCandidates = org.json.JSONArray()
     private val candidateHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -67,12 +68,17 @@ class CameraService : Service() {
             startForeground(1, notification)
         }
 
+        // 1. Inicia a câmera local imediatamente (para o preview aparecer sem atraso de rede)
+        startLocalCamera()
+
+        // 2. Conecta sinalização WebRTC
         connectSignaling(roomId)
 
         return START_STICKY
     }
 
     private fun initWebRTC() {
+        if (factory != null) return
         val options = PeerConnectionFactory.InitializationOptions.builder(this)
             .setEnableInternalTracer(true)
             .createInitializationOptions()
@@ -91,21 +97,117 @@ class CameraService : Service() {
             .createPeerConnectionFactory()
     }
 
+    private fun startLocalCamera() {
+        if (localVideoTrack != null) return
+        try {
+            initWebRTC()
+
+            videoCapturer = createVideoCapturer()
+            if (videoCapturer == null) {
+                Log.e(TAG, "Falha crítica: videoCapturer não pôde ser criado!")
+                return
+            }
+
+            surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
+            val isScreencast = videoCapturer?.isScreencast ?: false
+            videoSource = factory?.createVideoSource(isScreencast)
+            videoCapturer?.initialize(surfaceTextureHelper, this, videoSource?.capturerObserver)
+
+            // Tenta 1080p@30fps, com fallback seguro para 720p@30fps
+            try {
+                videoCapturer?.startCapture(1920, 1080, 30)
+                Log.d(TAG, "Câmera iniciada em 1920x1080 @ 30fps")
+            } catch (e: Exception) {
+                Log.w(TAG, "Falha ao iniciar em 1080p, tentando 720p...", e)
+                try {
+                    videoCapturer?.startCapture(1280, 720, 30)
+                    Log.d(TAG, "Câmera iniciada com fallback 1280x720 @ 30fps")
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Falha crítica ao iniciar captura de câmera", e2)
+                }
+            }
+
+            localVideoTrack = factory?.createVideoTrack("ARDAMSv0", videoSource)
+            localVideoTrack?.setEnabled(true)
+
+            // Conecta imediatamente todos os sinks que foram registrados antes do track ficar pronto
+            synchronized(attachedSinks) {
+                for (sink in attachedSinks) {
+                    localVideoTrack?.addSink(sink)
+                    Log.d(TAG, "Sink reanexado ao localVideoTrack")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao iniciar câmera local", e)
+        }
+    }
+
+    private fun createCameraEventsHandler(): CameraVideoCapturer.CameraEventsHandler {
+        return object : CameraVideoCapturer.CameraEventsHandler {
+            override fun onCameraError(errorDescription: String?) {
+                Log.e(TAG, "WebRTC Camera Error: $errorDescription")
+            }
+            override fun onCameraDisconnected() {
+                Log.w(TAG, "WebRTC Camera Disconnected")
+            }
+            override fun onCameraFreezed(errorDescription: String?) {
+                Log.w(TAG, "WebRTC Camera Freezed: $errorDescription")
+            }
+            override fun onCameraOpening(cameraName: String?) {
+                Log.d(TAG, "WebRTC Camera Opening: $cameraName")
+            }
+            override fun onFirstFrameAvailable() {
+                Log.d(TAG, "WebRTC Camera onFirstFrameAvailable! Transmissão de frames ativa!")
+            }
+            override fun onCameraClosed() {
+                Log.d(TAG, "WebRTC Camera Closed")
+            }
+        }
+    }
+
     private fun createVideoCapturer(): CameraVideoCapturer? {
-        val enumerator = Camera2Enumerator(this)
+        val enumerator: CameraEnumerator = if (Camera2Enumerator.isSupported(this)) {
+            Log.d(TAG, "Usando Camera2Enumerator")
+            Camera2Enumerator(this)
+        } else {
+            Log.d(TAG, "Camera2 não suportada, usando Camera1Enumerator")
+            Camera1Enumerator(true)
+        }
+
         val deviceNames = enumerator.deviceNames
-        // Prioriza câmera traseira
+        Log.d(TAG, "Câmeras encontradas: ${deviceNames.joinToString()}")
+
+        // 1. Prioriza câmera traseira
         for (deviceName in deviceNames) {
             if (enumerator.isBackFacing(deviceName)) {
-                return enumerator.createCapturer(deviceName, null)
+                val capturer = enumerator.createCapturer(deviceName, createCameraEventsHandler())
+                if (capturer != null) {
+                    Log.d(TAG, "Capturer criado com sucesso para câmera traseira: $deviceName")
+                    return capturer
+                }
             }
         }
-        // Fallback para frontal
+
+        // 2. Fallback para câmera frontal
         for (deviceName in deviceNames) {
             if (enumerator.isFrontFacing(deviceName)) {
-                return enumerator.createCapturer(deviceName, null)
+                val capturer = enumerator.createCapturer(deviceName, createCameraEventsHandler())
+                if (capturer != null) {
+                    Log.d(TAG, "Capturer criado com sucesso para câmera frontal: $deviceName")
+                    return capturer
+                }
             }
         }
+
+        // 3. Fallback genérico para qualquer câmera
+        for (deviceName in deviceNames) {
+            val capturer = enumerator.createCapturer(deviceName, createCameraEventsHandler())
+            if (capturer != null) {
+                Log.d(TAG, "Capturer criado para câmera genérica: $deviceName")
+                return capturer
+            }
+        }
+
         return null
     }
 
@@ -116,11 +218,8 @@ class CameraService : Service() {
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "Sinalização conectada para a sala: $roomId")
-                if (!isStreamingStarted) {
-                    startStreaming(roomId)
-                } else {
-                    sendOffer(roomId)
-                }
+                initPeerConnection(roomId)
+                sendOffer(roomId)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -139,6 +238,7 @@ class CameraService : Service() {
                     // Receptor anunciou que abriu ou reconectou: reenvia offer
                     if (type == "receiver-ready") {
                         Log.d(TAG, "Receptor Web anunciou que está pronto! Enviando offer...")
+                        initPeerConnection(roomId)
                         sendOffer(roomId)
                     } else if (type == "answer" && json.has("answer")) {
                         Log.d(TAG, "Recebeu SDP Answer do receptor!")
@@ -223,25 +323,8 @@ class CameraService : Service() {
         }
     }
 
-    private fun sendOffer(roomId: String) {
-        peerConnection?.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(sessionDescription: SessionDescription) {
-                peerConnection?.setLocalDescription(SimpleSdpObserver(), sessionDescription)
-
-                val json = JSONObject().apply {
-                    put("type", "offer")
-                    put("offer", JSONObject().apply {
-                        put("type", sessionDescription.type.canonicalForm())
-                        put("sdp", sessionDescription.description)
-                    })
-                }
-                sendSignal(roomId, json)
-            }
-        }, MediaConstraints())
-    }
-
-    private fun startStreaming(roomId: String) {
-        isStreamingStarted = true
+    private fun initPeerConnection(roomId: String) {
+        if (peerConnection != null) return
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -292,33 +375,54 @@ class CameraService : Service() {
             override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {}
         })
 
-        videoCapturer = createVideoCapturer()
-        surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
-        val isScreencast = videoCapturer?.isScreencast ?: false
-        videoSource = factory?.createVideoSource(isScreencast)
-        videoCapturer?.initialize(surfaceTextureHelper, this, videoSource?.capturerObserver)
+        if (localVideoTrack != null) {
+            peerConnection?.addTrack(localVideoTrack, listOf("ARDAMS"))
+            Log.d(TAG, "localVideoTrack adicionado ao peerConnection com sucesso")
+        }
+    }
 
-        // Alta Resolução 1080p @ 30fps
-        videoCapturer?.startCapture(1920, 1080, 30)
+    private fun sendOffer(roomId: String) {
+        initPeerConnection(roomId)
 
-        localVideoTrack = factory?.createVideoTrack("ARDAMSv0", videoSource)
-        peerConnection?.addTrack(localVideoTrack, listOf("ARDAMS"))
+        val mediaConstraints = MediaConstraints().apply {
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+        }
 
-        sendOffer(roomId)
+        peerConnection?.createOffer(object : SimpleSdpObserver() {
+            override fun onCreateSuccess(sessionDescription: SessionDescription) {
+                peerConnection?.setLocalDescription(SimpleSdpObserver(), sessionDescription)
+
+                val json = JSONObject().apply {
+                    put("type", "offer")
+                    put("offer", JSONObject().apply {
+                        put("type", sessionDescription.type.canonicalForm())
+                        put("sdp", sessionDescription.description)
+                    })
+                }
+                sendSignal(roomId, json)
+                Log.d(TAG, "Offer SDP enviado para sala $roomId")
+            }
+        }, mediaConstraints)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
-            isStreamingStarted = false
+            if (candidateRunnable != null) {
+                candidateHandler.removeCallbacks(candidateRunnable!!)
+            }
             videoCapturer?.stopCapture()
             videoCapturer?.dispose()
+            videoCapturer = null
             surfaceTextureHelper?.dispose()
+            surfaceTextureHelper = null
             videoSource?.dispose()
+            videoSource = null
             localVideoTrack?.dispose()
+            localVideoTrack = null
             peerConnection?.close()
-            factory?.dispose()
-            eglBase.release()
+            peerConnection = null
             webSocket?.close(1000, "Service stopped")
         } catch (e: Exception) {
             Log.e(TAG, "Erro ao liberar recursos", e)
@@ -337,11 +441,21 @@ class CameraService : Service() {
     }
 
     fun attachSurfaceView(renderer: org.webrtc.VideoSink) {
+        synchronized(attachedSinks) {
+            if (!attachedSinks.contains(renderer)) {
+                attachedSinks.add(renderer)
+            }
+        }
         localVideoTrack?.addSink(renderer)
+        Log.d(TAG, "attachSurfaceView anexado. localVideoTrack presente? ${localVideoTrack != null}")
     }
 
     fun detachSurfaceView(renderer: org.webrtc.VideoSink) {
+        synchronized(attachedSinks) {
+            attachedSinks.remove(renderer)
+        }
         localVideoTrack?.removeSink(renderer)
+        Log.d(TAG, "detachSurfaceView desanexado")
     }
 
     private fun createNotificationChannel() {

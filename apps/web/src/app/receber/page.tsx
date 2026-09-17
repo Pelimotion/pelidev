@@ -95,10 +95,17 @@ function ReceberContent() {
     pcRef.current = pc;
 
     pc.ontrack = (event) => {
-      console.log("[WebRTC] Stream track recebido!", event.streams);
-      if (videoRef.current && event.streams[0]) {
-        videoRef.current.srcObject = event.streams[0];
-        videoRef.current.play().catch(console.error);
+      console.log("[WebRTC] Stream track recebido!", event.streams, event.track);
+      if (videoRef.current) {
+        if (event.streams && event.streams[0]) {
+          videoRef.current.srcObject = event.streams[0];
+        } else if (event.track) {
+          videoRef.current.srcObject = new MediaStream([event.track]);
+        }
+        videoRef.current.play().catch((e) => console.warn("[WebRTC] Autoplay bloqueado:", e));
+        event.track.onunmute = () => {
+          videoRef.current?.play().catch(console.error);
+        };
         setStatus("connected");
       }
     };
