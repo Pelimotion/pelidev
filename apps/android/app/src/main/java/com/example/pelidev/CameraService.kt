@@ -36,6 +36,7 @@ class CameraService : Service() {
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
     private var videoSource: VideoSource? = null
     private var localVideoTrack: VideoTrack? = null
+    private var isStreamingStarted = false
 
     private val eglBase = EglBase.create()
 
@@ -51,7 +52,7 @@ class CameraService : Service() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("PeliDev Cam Transmitindo")
-            .setContentText("Sala ativa: $roomId (1080p)")
+            .setContentText("Sala: $roomId (Full HD 1080p)")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setOngoing(true)
@@ -96,7 +97,7 @@ class CameraService : Service() {
                 return enumerator.createCapturer(deviceName, null)
             }
         }
-        // Fallback para câmera frontal
+        // Fallback para frontal
         for (deviceName in deviceNames) {
             if (enumerator.isFrontFacing(deviceName)) {
                 return enumerator.createCapturer(deviceName, null)
@@ -112,7 +113,11 @@ class CameraService : Service() {
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "Sinalização conectada para a sala: $roomId")
-                startStreaming(roomId)
+                if (!isStreamingStarted) {
+                    startStreaming(roomId)
+                } else {
+                    sendOffer(roomId)
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -127,7 +132,12 @@ class CameraService : Service() {
                     if (json.optString("senderId") == mySenderId) return // Ignora eco próprio
 
                     val type = json.optString("type")
-                    if (type == "answer" && json.has("answer")) {
+
+                    // Receptor anunciou que abriu ou reconectou: reenvia offer
+                    if (type == "receiver-ready") {
+                        Log.d(TAG, "Receptor Web anunciou que está pronto! Enviando offer...")
+                        sendOffer(roomId)
+                    } else if (type == "answer" && json.has("answer")) {
                         Log.d(TAG, "Recebeu SDP Answer do receptor!")
                         val answer = json.getJSONObject("answer")
                         val sdp = SessionDescription(
@@ -136,7 +146,7 @@ class CameraService : Service() {
                         )
                         peerConnection?.setRemoteDescription(SimpleSdpObserver(), sdp)
 
-                        // Descarrega candidatos que chegaram antes do answer
+                        // Descarrega candidatos acumulados
                         synchronized(candidateQueue) {
                             for (c in candidateQueue) {
                                 peerConnection?.addIceCandidate(c)
@@ -195,7 +205,26 @@ class CameraService : Service() {
         }
     }
 
+    private fun sendOffer(roomId: String) {
+        peerConnection?.createOffer(object : SimpleSdpObserver() {
+            override fun onCreateSuccess(sessionDescription: SessionDescription) {
+                peerConnection?.setLocalDescription(SimpleSdpObserver(), sessionDescription)
+
+                val json = JSONObject().apply {
+                    put("type", "offer")
+                    put("offer", JSONObject().apply {
+                        put("type", sessionDescription.type.canonicalForm())
+                        put("sdp", sessionDescription.description)
+                    })
+                }
+                sendSignal(roomId, json)
+            }
+        }, MediaConstraints())
+    }
+
     private fun startStreaming(roomId: String) {
+        isStreamingStarted = true
+
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
@@ -241,31 +270,19 @@ class CameraService : Service() {
         videoSource = factory?.createVideoSource(isScreencast)
         videoCapturer?.initialize(surfaceTextureHelper, this, videoSource?.capturerObserver)
 
-        // 1080p @ 30fps
+        // Alta Resolução 1080p @ 30fps
         videoCapturer?.startCapture(1920, 1080, 30)
 
         localVideoTrack = factory?.createVideoTrack("ARDAMSv0", videoSource)
         peerConnection?.addTrack(localVideoTrack, listOf("ARDAMS"))
 
-        peerConnection?.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(sessionDescription: SessionDescription) {
-                peerConnection?.setLocalDescription(SimpleSdpObserver(), sessionDescription)
-
-                val json = JSONObject().apply {
-                    put("type", "offer")
-                    put("offer", JSONObject().apply {
-                        put("type", sessionDescription.type.canonicalForm())
-                        put("sdp", sessionDescription.description)
-                    })
-                }
-                sendSignal(roomId, json)
-            }
-        }, MediaConstraints())
+        sendOffer(roomId)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
+            isStreamingStarted = false
             videoCapturer?.stopCapture()
             videoCapturer?.dispose()
             surfaceTextureHelper?.dispose()
