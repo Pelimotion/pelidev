@@ -43,6 +43,13 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import org.webrtc.SurfaceViewRenderer
+import org.webrtc.RendererCommon
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
@@ -193,7 +200,64 @@ fun CameraControlScreen(
     val serverUrl by remember { mutableStateOf("https://pelidev.vercel.app") }
     var isStreaming by remember { mutableStateOf(false) }
     var isScanningQr by remember { mutableStateOf(false) }
+    var isBlackScreenMode by remember { mutableStateOf(false) }
     val clipboardManager = LocalClipboardManager.current
+    val window = (context as? android.app.Activity)?.window
+
+    var cameraService by remember { mutableStateOf<CameraService?>(null) }
+    val connection = remember {
+        object : ServiceConnection {
+            override fun onServiceConnected(className: ComponentName, service: IBinder) {
+                val binder = service as CameraService.LocalBinder
+                cameraService = binder.getService()
+            }
+            override fun onServiceDisconnected(arg0: ComponentName) {
+                cameraService = null
+            }
+        }
+    }
+
+    LaunchedEffect(isStreaming) {
+        if (isStreaming) {
+            val intent = Intent(context, CameraService::class.java)
+            context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        } else {
+            if (cameraService != null) {
+                context.unbindService(connection)
+                cameraService = null
+            }
+        }
+    }
+
+    LaunchedEffect(isBlackScreenMode) {
+        if (isBlackScreenMode) {
+            val params = window?.attributes
+            params?.screenBrightness = 0.01f
+            window?.attributes = params
+        } else {
+            val params = window?.attributes
+            params?.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            window?.attributes = params
+        }
+    }
+
+    if (isBlackScreenMode) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = { isBlackScreenMode = false },
+                        onLongPress = { isBlackScreenMode = false },
+                        onTap = {
+                            Toast.makeText(context, "Dê um toque duplo para sair da Tela Preta", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+        )
+        return
+    }
 
     val receiverUrl = "$serverUrl/receber?roomId=$roomId"
 
@@ -263,11 +327,38 @@ fun CameraControlScreen(
 
         // Center Content: QR Scan & Room Settings
         Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
         ) {
-            // Big QR Code Scan Button (Zero Friction Pairing!)
-            if (!isStreaming) {
+            if (isStreaming) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (cameraService != null) {
+                        WebRtcPreview(cameraService!!)
+                    } else {
+                        CircularProgressIndicator(color = Color(0xFF6366F1))
+                    }
+
+                    Button(
+                        onClick = { isBlackScreenMode = true },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.7f)),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("🌙 Modo Tela Preta", color = Color.White)
+                    }
+                }
+            } else {
+                // Big QR Code Scan Button (Zero Friction Pairing!)
                 Button(
                     onClick = { isScanningQr = true },
                     modifier = Modifier
@@ -583,4 +674,24 @@ fun QrScannerView(
             }
         }
     }
+}
+
+@Composable
+fun WebRtcPreview(cameraService: CameraService) {
+    AndroidView(
+        factory = { ctx ->
+            SurfaceViewRenderer(ctx).apply {
+                init(cameraService.getEglBaseContext(), null)
+                setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                setEnableHardwareScaler(true)
+                cameraService.attachSurfaceView(this)
+            }
+        },
+        update = { },
+        onRelease = { view ->
+            cameraService.detachSurfaceView(view)
+            view.release()
+        },
+        modifier = Modifier.fillMaxSize()
+    )
 }

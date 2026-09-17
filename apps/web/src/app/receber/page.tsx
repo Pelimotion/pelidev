@@ -63,6 +63,8 @@ function ReceberContent() {
   const candidateQueue = useRef<RTCIceCandidateInit[]>([]);
   const senderIdRef = useRef<string>(uuidv4());
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const batchedCandidates = useRef<RTCIceCandidateInit[]>([]);
+  const candidateTimer = useRef<NodeJS.Timeout | null>(null);
 
   const sendSignal = async (room: string, payload: unknown) => {
     try {
@@ -103,11 +105,18 @@ function ReceberContent() {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        sendSignal(id, {
-          senderId: senderIdRef.current,
-          type: "candidate",
-          candidate: event.candidate.toJSON(),
-        });
+        batchedCandidates.current.push(event.candidate.toJSON());
+        if (!candidateTimer.current) {
+          candidateTimer.current = setTimeout(() => {
+            sendSignal(id, {
+              senderId: senderIdRef.current,
+              type: "candidates-batch",
+              candidates: batchedCandidates.current,
+            });
+            batchedCandidates.current = [];
+            candidateTimer.current = null;
+          }, 1000);
+        }
       }
     };
 
@@ -162,6 +171,14 @@ function ReceberContent() {
             await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.error);
           } else {
             candidateQueue.current.push(data.candidate);
+          }
+        } else if (data.type === "candidates-batch" && data.candidates) {
+          for (const c of data.candidates) {
+            if (pc.remoteDescription && pc.remoteDescription.type) {
+              await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+            } else {
+              candidateQueue.current.push(c);
+            }
           }
         }
       } catch (err) {

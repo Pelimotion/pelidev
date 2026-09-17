@@ -23,6 +23,8 @@ function TransmitirContent() {
   const candidateQueue = useRef<RTCIceCandidateInit[]>([]);
   const senderIdRef = useRef<string>(uuidv4());
   const isNegotiating = useRef(false);
+  const batchedCandidates = useRef<RTCIceCandidateInit[]>([]);
+  const candidateTimer = useRef<NodeJS.Timeout | null>(null);
 
   const [status, setStatus] = useState("Iniciando câmera...");
   const [isConnected, setIsConnected] = useState(false);
@@ -59,6 +61,7 @@ function TransmitirContent() {
       setStream(newStream);
       if (videoRef.current) {
         videoRef.current.srcObject = newStream;
+        videoRef.current.play().catch(e => console.warn("Auto-play prevented:", e));
       }
       return newStream;
     } catch (err) {
@@ -71,6 +74,7 @@ function TransmitirContent() {
         setStream(fallbackStream);
         if (videoRef.current) {
           videoRef.current.srcObject = fallbackStream;
+          videoRef.current.play().catch(e => console.warn("Auto-play prevented:", e));
         }
         return fallbackStream;
       } catch (fatal) {
@@ -116,11 +120,18 @@ function TransmitirContent() {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        sendSignal(roomId, {
-          senderId: senderIdRef.current,
-          type: "candidate",
-          candidate: event.candidate.toJSON(),
-        });
+        batchedCandidates.current.push(event.candidate.toJSON());
+        if (!candidateTimer.current) {
+          candidateTimer.current = setTimeout(() => {
+            sendSignal(roomId, {
+              senderId: senderIdRef.current,
+              type: "candidates-batch",
+              candidates: batchedCandidates.current,
+            });
+            batchedCandidates.current = [];
+            candidateTimer.current = null;
+          }, 1000);
+        }
       }
     };
 
@@ -172,6 +183,14 @@ function TransmitirContent() {
             await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.error);
           } else {
             candidateQueue.current.push(data.candidate);
+          }
+        } else if (data.type === "candidates-batch" && data.candidates) {
+          for (const c of data.candidates) {
+            if (pc.remoteDescription && pc.remoteDescription.type) {
+              await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+            } else {
+              candidateQueue.current.push(c);
+            }
           }
         }
       } catch (err) {

@@ -39,6 +39,9 @@ class CameraService : Service() {
     private var isStreamingStarted = false
 
     private val eglBase = EglBase.create()
+    private var batchedCandidates = org.json.JSONArray()
+    private val candidateHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var candidateRunnable: Runnable? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -165,6 +168,21 @@ class CameraService : Service() {
                         } else {
                             candidateQueue.add(candidate)
                         }
+                    } else if (type == "candidates-batch" && json.has("candidates")) {
+                        val array = json.getJSONArray("candidates")
+                        for (i in 0 until array.length()) {
+                            val candidateNode = array.getJSONObject(i)
+                            val candidate = IceCandidate(
+                                candidateNode.getString("sdpMid"),
+                                candidateNode.getInt("sdpMLineIndex"),
+                                candidateNode.getString("candidate")
+                            )
+                            if (peerConnection?.remoteDescription != null) {
+                                peerConnection?.addIceCandidate(candidate)
+                            } else {
+                                candidateQueue.add(candidate)
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Erro ao processar mensagem de sinalização", e)
@@ -245,15 +263,25 @@ class CameraService : Service() {
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {}
 
             override fun onIceCandidate(candidate: IceCandidate) {
-                val json = JSONObject().apply {
-                    put("type", "candidate")
-                    put("candidate", JSONObject().apply {
-                        put("sdpMid", candidate.sdpMid)
-                        put("sdpMLineIndex", candidate.sdpMLineIndex)
-                        put("candidate", candidate.sdp)
-                    })
+                val candidateObj = JSONObject().apply {
+                    put("sdpMid", candidate.sdpMid)
+                    put("sdpMLineIndex", candidate.sdpMLineIndex)
+                    put("candidate", candidate.sdp)
                 }
-                sendSignal(roomId, json)
+                batchedCandidates.put(candidateObj)
+
+                if (candidateRunnable == null) {
+                    candidateRunnable = Runnable {
+                        val json = JSONObject().apply {
+                            put("type", "candidates-batch")
+                            put("candidates", batchedCandidates)
+                        }
+                        sendSignal(roomId, json)
+                        batchedCandidates = org.json.JSONArray()
+                        candidateRunnable = null
+                    }
+                    candidateHandler.postDelayed(candidateRunnable!!, 1000)
+                }
             }
 
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
@@ -297,7 +325,24 @@ class CameraService : Service() {
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    inner class LocalBinder : android.os.Binder() {
+        fun getService(): CameraService = this@CameraService
+    }
+    private val binder = LocalBinder()
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    fun getEglBaseContext(): org.webrtc.EglBase.Context {
+        return eglBase.eglBaseContext
+    }
+
+    fun attachSurfaceView(renderer: org.webrtc.VideoSink) {
+        localVideoTrack?.addSink(renderer)
+    }
+
+    fun detachSurfaceView(renderer: org.webrtc.VideoSink) {
+        localVideoTrack?.removeSink(renderer)
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
