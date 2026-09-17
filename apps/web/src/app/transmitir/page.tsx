@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
-import { Camera, RefreshCw } from "lucide-react";
+import { Camera, RefreshCw, Loader2, Radio } from "lucide-react";
+import { motion } from "framer-motion";
 
 function TransmitirContent() {
   const searchParams = useSearchParams();
@@ -12,6 +13,7 @@ function TransmitirContent() {
   const wsRef = useRef<WebSocket | null>(null);
   
   const [status, setStatus] = useState("Iniciando...");
+  const [isConnected, setIsConnected] = useState(false);
   const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
   const [stream, setStream] = useState<MediaStream | null>(null);
 
@@ -28,7 +30,7 @@ function TransmitirContent() {
           height: { ideal: 1080 },
           frameRate: { ideal: 30 }
         },
-        audio: false // Para MVP de webcam, apenas vídeo
+        audio: false 
       });
       
       setStream(newStream);
@@ -56,7 +58,7 @@ function TransmitirContent() {
     wsRef.current = ws;
 
     ws.onopen = async () => {
-      setStatus("Conectado à sala. Negociando conexão...");
+      setStatus("Negociando conexão...");
       
       const configuration = {
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -65,7 +67,6 @@ function TransmitirContent() {
       const pc = new RTCPeerConnection(configuration);
       pcRef.current = pc;
 
-      // Adiciona as tracks da câmera ao PeerConnection
       currentStream.getTracks().forEach((track) => {
         pc.addTrack(track, currentStream);
       });
@@ -78,13 +79,14 @@ function TransmitirContent() {
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === "connected") {
-          setStatus("Transmitindo ao vivo!");
+          setStatus("Transmitindo ao vivo");
+          setIsConnected(true);
         } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
           setStatus("Conexão perdida. Tentando reconectar...");
+          setIsConnected(false);
         }
       };
 
-      // Cria a oferta
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       ws.send(JSON.stringify({ type: "offer", offer }));
@@ -101,6 +103,7 @@ function TransmitirContent() {
     
     ws.onclose = () => {
         setStatus("Desconectado do servidor.");
+        setIsConnected(false);
     };
   };
 
@@ -125,7 +128,7 @@ function TransmitirContent() {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId]); // Removido facingMode para não recriar a conexão toda vez que mudar a câmera. 
+  }, [roomId]); 
 
   const toggleCamera = async () => {
     const newMode = facingMode === "environment" ? "user" : "environment";
@@ -133,7 +136,6 @@ function TransmitirContent() {
     
     const newStream = await startCamera(newMode);
     
-    // Troca a track enviada no WebRTC sem derrubar a conexão
     if (newStream && pcRef.current) {
       const videoTrack = newStream.getVideoTracks()[0];
       const sender = pcRef.current.getSenders().find(s => s.track?.kind === "video");
@@ -144,42 +146,66 @@ function TransmitirContent() {
   };
 
   if (!roomId) {
-    return <div className="p-8 text-center text-white bg-black h-screen">URL inválida. Escaneie o QR Code no receptor.</div>;
+    return (
+      <div className="flex items-center justify-center h-screen bg-[#0A0A0B] text-white">
+        <div className="bg-white/5 border border-white/10 p-8 rounded-2xl max-w-sm text-center space-y-4">
+          <Camera size={48} className="mx-auto text-gray-400" />
+          <h2 className="text-xl font-semibold">Sala Inválida</h2>
+          <p className="text-gray-400 text-sm">Escaneie o QR Code no computador para iniciar a transmissão.</p>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div className="h-screen bg-black text-white flex flex-col">
-      <div className="absolute top-4 left-4 right-4 z-10 flex justify-between items-start">
-        <div className="bg-black/50 p-3 rounded-lg backdrop-blur-md">
-          <p className="text-sm font-bold flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${status === 'Transmitindo ao vivo!' ? 'bg-red-500 animate-pulse' : 'bg-yellow-500'}`}></span>
-            Transmissor
-          </p>
-          <p className="text-xs text-gray-300 mt-1">{status}</p>
+    <div className="h-screen w-screen bg-[#0A0A0B] text-white flex flex-col relative overflow-hidden">
+      
+      {/* Header UI Overlay */}
+      <motion.div 
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="absolute top-6 left-6 right-6 z-10 flex justify-between items-start"
+      >
+        <div className="bg-black/60 border border-white/10 p-3 px-5 rounded-2xl backdrop-blur-xl flex flex-col shadow-2xl">
+          <div className="flex items-center gap-2 mb-1">
+            <Radio size={16} className={isConnected ? "text-red-500 animate-pulse" : "text-yellow-500"} />
+            <span className="text-sm font-bold tracking-wide">{isConnected ? 'AO VIVO' : 'CONECTANDO'}</span>
+          </div>
+          <span className="text-xs text-gray-400 font-mono">{status}</span>
         </div>
         
-        <button 
+        <motion.button 
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
           onClick={toggleCamera}
-          className="bg-white/20 p-3 rounded-full backdrop-blur-md hover:bg-white/30 transition"
+          className="bg-black/60 border border-white/10 p-4 rounded-full backdrop-blur-xl shadow-2xl hover:bg-white/10 transition-colors"
         >
-          <RefreshCw size={24} />
-        </button>
-      </div>
+          <RefreshCw size={24} className="text-gray-200" />
+        </motion.button>
+      </motion.div>
 
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted
-        className="w-full h-full object-cover"
-      />
+      {/* Video View */}
+      <div className="relative w-full h-full bg-black flex items-center justify-center">
+        {!stream && <Loader2 size={48} className="text-blue-500 animate-spin absolute z-0" />}
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={`w-full h-full object-cover transition-opacity duration-700 ${stream ? 'opacity-100' : 'opacity-0'}`}
+        />
+      </div>
     </div>
   );
 }
 
 export default function TransmitirPage() {
   return (
-    <Suspense fallback={<div className="h-screen bg-black text-white p-8">Carregando câmera...</div>}>
+    <Suspense fallback={
+      <div className="h-screen bg-[#0A0A0B] flex items-center justify-center">
+        <Loader2 className="animate-spin text-blue-500" size={32} />
+      </div>
+    }>
       <TransmitirContent />
     </Suspense>
   );
